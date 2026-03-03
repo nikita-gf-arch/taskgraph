@@ -3,8 +3,10 @@ package taskgraph
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -647,4 +649,156 @@ func checkCycle(node *graphNode, path []string) error {
 		}
 	}
 	return nil
+}
+
+// ResultFormatter translates domain-specific types into JSON-friendly maps.
+type ResultFormatter func(val any) map[string]any
+
+func idsToStrings(ids []ID) []string {
+	s := make([]string, len(ids))
+	for i, id := range ids {
+		s[i] = id.String()
+	}
+	return s
+}
+
+type GraphExecutionReport struct {
+	GraphName string                `json:"graphName"`
+	Keys      map[string]KeyReport  `json:"keys"`
+	Tasks     map[string]TaskReport `json:"tasks"`
+}
+
+type KeyReport struct {
+	ID           string `json:"id"`
+	Status       string `json:"status"`                 // PRESENT, ABSENT, PENDING
+	Source       string `json:"source"`                 // TASK or INPUT
+	ProducerTask string `json:"producerTask,omitempty"` // The ID of the task providing this key
+	Value        any    `json:"value,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+type TaskReport struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"` // COMPLETED, FAILED, SKIPPED, PENDING
+	Location   string   `json:"location"`
+	DurationMs int64    `json:"durationMs,omitempty"`
+	DependsOn  []string `json:"dependsOn"`
+	Provides   []string `json:"provides"`
+	// Diagnostics
+	BlockedBy    []string `json:"blockedBy,omitempty"`    // Keys currently PENDING
+	FailureTrace []string `json:"failureTrace,omitempty"` // Keys currently ABSENT/Error
+}
+
+func (g *graph) ToJSON(b Binder, formatters map[reflect.Type]ResultFormatter) ([]byte, error) {
+	report := GraphExecutionReport{
+		GraphName: g.name,
+		Keys:      make(map[string]KeyReport),
+		Tasks:     make(map[string]TaskReport),
+	}
+
+	// 1. Map Keys to Producers (Pre-calculation)
+	keyToProducer := make(map[string]string)
+	for _, node := range g.nodes {
+		for _, p := range node.task.Provides() {
+			keyToProducer[p.String()] = node.id
+		}
+	}
+
+	// 2. Build the Key Registry
+	allIDs := set.NewSet[ID]()
+	allIDs.Append(g.allDependencies.ToSlice()...)
+	allIDs.Append(g.allProvided.ToSlice()...)
+
+	for _, id := range allIDs.ToSlice() {
+		binding := b.Get(id)
+		idStr := id.String()
+
+		kr := KeyReport{
+			ID:     idStr,
+			Status: binding.Status().String(),
+			Source: "INPUT",
+		}
+
+		if producer, ok := keyToProducer[idStr]; ok {
+			kr.Source = "TASK"
+			kr.ProducerTask = producer
+		}
+
+		if binding.Status() == Present {
+			val := binding.Value()
+			if val != nil {
+				if f, ok := formatters[reflect.TypeOf(val)]; ok {
+					kr.Value = f(val)
+				} else {
+					kr.Value = fmt.Sprintf("%v", val)
+				}
+			}
+		} else if binding.Status() == Absent && binding.Error() != nil {
+			// Captures BindError vs BindAbsent
+			kr.Error = binding.Error().Error()
+		}
+		report.Keys[idStr] = kr
+	}
+
+	// 3. Build Task Execution State
+	for _, node := range g.nodes {
+		t := node.task
+		provides := t.Provides()
+		depends := t.Depends()
+
+		tr := TaskReport{
+			ID:        node.id,
+			Name:      t.Name(),
+			Location:  t.Location(),
+			DependsOn: idsToStrings(depends),
+			Provides:  idsToStrings(provides),
+			Status:    "PENDING",
+		}
+
+		// Calculate Aggregate Status
+		if len(provides) > 0 {
+			pCount, aCount := 0, 0
+			var taskErr error
+			for _, p := range provides {
+				bind := b.Get(p)
+				if bind.Status() == Present {
+					pCount++
+				} else if bind.Status() == Absent {
+					aCount++
+					if err := bind.Error(); err != nil && !errors.Is(err, ErrIsAbsent) {
+						taskErr = err
+					}
+				}
+			}
+
+			if pCount == len(provides) {
+				tr.Status = "COMPLETED"
+			} else if aCount > 0 {
+				if taskErr != nil {
+					tr.Status = "FAILED" // Task called BindError
+				} else {
+					tr.Status = "SKIPPED" // Task called BindAbsent (Logical skip)
+				}
+			}
+		}
+
+		// 4. Trace the "Why" for Pending tasks
+		if tr.Status == "PENDING" {
+			for _, d := range depends {
+				kID := d.String()
+				keyState := report.Keys[kID]
+
+				if keyState.Status == "PENDING" {
+					tr.BlockedBy = append(tr.BlockedBy, kID)
+				} else if keyState.Status == "ABSENT" {
+					tr.FailureTrace = append(tr.FailureTrace, kID)
+				}
+			}
+		}
+
+		report.Tasks[node.id] = tr
+	}
+
+	return json.MarshalIndent(report, "", "  ")
 }
